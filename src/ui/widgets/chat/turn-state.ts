@@ -6,6 +6,7 @@ import {
 } from "../chat-streaming-state";
 
 export interface ChatPanelMessage {
+    id?: number;
     role: "user" | "kokoro" | "tool" | "context";
     text: string;
     images?: string[];
@@ -16,6 +17,7 @@ export interface ChatPanelMessage {
     capturedAt?: string;
     source?: string;
     turnId?: string;
+    clientRequestId?: string;
 }
 
 export interface PendingTurnState {

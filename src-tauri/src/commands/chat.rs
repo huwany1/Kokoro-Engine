@@ -510,6 +510,15 @@ pub struct ChatRequest {
     /// Optional caller correlation echoed on turn lifecycle events.
     #[serde(default)]
     pub client_request_id: Option<String>,
+    /// If true, this turn is regenerating an assistant reply for the last user message.
+    #[serde(default)]
+    pub regenerate: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StreamChatResponse {
+    pub conversation_id: String,
+    pub user_message_id: Option<i64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -591,7 +600,7 @@ async fn persist_vision_context_message(
     if let Some(turn_id) = turn_id {
         metadata["turn_id"] = serde_json::Value::String(turn_id.to_string());
     }
-    state
+    let _ = state
         .add_message_with_metadata(
             "context".to_string(),
             observation.summary.clone(),
@@ -1116,6 +1125,57 @@ fn tool_trace_success_message() -> Option<String> {
     .map(ToString::to_string)
 }
 
+#[inline]
+pub(crate) fn should_insert_user_message_for_request(
+    hidden: bool,
+    regenerate: bool,
+    has_trailing_user_message: bool,
+) -> bool {
+    if hidden {
+        return false;
+    }
+    if regenerate {
+        !has_trailing_user_message
+    } else {
+        true
+    }
+}
+
+pub(crate) async fn resolve_trailing_visible_user_message(
+    db: &sqlx::SqlitePool,
+    conversation_id: &str,
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        "SELECT id, role, content, metadata FROM conversation_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 50"
+    )
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await?;
+
+    for (id, role, content, metadata) in rows {
+        if role == "tool" {
+            continue;
+        }
+        let technical_type = metadata
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()));
+        if matches!(
+            technical_type.as_deref(),
+            Some("assistant_tool_calls") | Some("translation_instruction") | Some("tool_result")
+        ) {
+            continue;
+        }
+
+        if role == "user" {
+            return Ok(Some((id, content)));
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
 // ── Stream Chat Command ────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1137,7 +1197,7 @@ pub async fn stream_chat(
         '_,
         std::sync::Arc<tokio::sync::Mutex<crate::vision::server::VisionServer>>,
     >,
-) -> Result<(), KokoroError> {
+) -> Result<StreamChatResponse, KokoroError> {
     // Gate chat if runtime is degraded (e.g. startup recovery failure)
     if let Some(reason) = state.get_runtime_degraded().await {
         return Err(KokoroError::Chat(format!(
@@ -1196,14 +1256,34 @@ pub async fn stream_chat(
         .latest_completed_observation(chrono::Utc::now())
         .await;
 
-    // 2. Update History with User Message (skip for hidden/touch interactions)
+    // 2. Update History with User Message (skip for hidden/touch interactions, or regenerate when user msg already trailing in DB)
     let system_provider = llm_state.system_provider().await;
-    if !request.hidden {
+    let current_conv_id = state.current_conversation_id.lock().await.clone();
+    let trailing_visible_user = if request.regenerate {
+        if let Some(ref cid) = current_conv_id {
+            match resolve_trailing_visible_user_message(&state.db, cid).await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::warn!("[stream_chat] Failed to query trailing visible message: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let has_trailing_user = trailing_visible_user.is_some();
+    let should_insert = should_insert_user_message_for_request(request.hidden, request.regenerate, has_trailing_user);
+
+    let (conversation_id, user_message_id) = if should_insert {
         if let Some(observation) = selected_vision_observation.as_ref() {
             persist_vision_context_message(&state, observation, &char_id, None).await;
         }
 
-        state
+        let (cid, mid) = state
             .add_message_with_metadata(
                 "user".to_string(),
                 request.message.clone(),
@@ -1211,14 +1291,15 @@ pub async fn stream_chat(
                 &char_id,
                 Some(system_provider.clone()),
             )
-            .await;
+            .await
+            .map_err(|e| KokoroError::Database(e.to_string()))?;
 
         if let Some(hooks) = hook_runtime.as_ref() {
             hooks
                 .emit_best_effort(
                     &HookEvent::AfterUserMessagePersisted,
                     &build_chat_hook_payload(
-                        conversation_id.clone(),
+                        Some(cid.clone()),
                         &char_id,
                         None,
                         Some(request.message.clone()),
@@ -1229,7 +1310,27 @@ pub async fn stream_chat(
                 )
                 .await;
         }
-    }
+        (cid, Some(mid))
+    } else {
+        let cid = current_conv_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mid = trailing_visible_user.map(|(id, _)| id);
+
+        // 防御性对齐：若因长会话预算或回溯导致当前 history 尾部缺失该用户消息，在内存中补齐供当前 turn 组装 prompt
+        if !request.hidden {
+            let mut history = state.history.lock().await;
+            let trailing_matches = history.back().is_some_and(|m| m.role == "user");
+            if !trailing_matches {
+                history.push_back(crate::ai::context::Message {
+                    role: "user".to_string(),
+                    content: request.message.clone(),
+                    metadata: None,
+                });
+            }
+        }
+
+        (cid, mid)
+    };
 
     // ── LAYER 1 & 2: SYSTEM SETUP ───────────────────────────────
 
@@ -1315,7 +1416,7 @@ pub async fn stream_chat(
 
     let stream_result: Result<(), KokoroError> = async {
     let mut before_llm_request_payload = build_before_llm_request_payload(
-        conversation_id.clone(),
+        Some(conversation_id.clone()),
         &char_id,
         Some(assistant_turn_id.clone()),
         request.message.clone(),
@@ -1342,7 +1443,7 @@ pub async fn stream_chat(
             .emit_best_effort(
                 &HookEvent::BeforeLlmRequest,
                 &build_chat_hook_payload(
-                    conversation_id.clone(),
+                    Some(conversation_id.clone()),
                     &char_id,
                     Some(assistant_turn_id.clone()),
                     Some(effective_request_message.clone()),
@@ -1358,6 +1459,8 @@ pub async fn stream_chat(
         serde_json::json!({
             "turn_id": assistant_turn_id,
             "client_request_id": request.client_request_id,
+            "conversation_id": conversation_id,
+            "user_message_id": user_message_id,
         }),
     )
     .map_err(|e| KokoroError::Chat(e.to_string()))?;
@@ -1535,7 +1638,7 @@ pub async fn stream_chat(
                             .map_err(|emit_error| KokoroError::Chat(emit_error.to_string()))?;
 
                         let failure_event = err_payload.clone().into_failure_event(
-                            conversation_id.clone(),
+                            Some(conversation_id.clone()),
                             Some(assistant_turn_id.clone()),
                             Some(char_id.clone()),
                             None,
@@ -1815,7 +1918,7 @@ pub async fn stream_chat(
                     serde_json::Value::Array(round_provider_data.clone());
             }
             let assistant_tool_call_metadata = assistant_tool_call_metadata_value.to_string();
-            state
+            let _ = state
                 .add_message_with_metadata(
                     "assistant".to_string(),
                     cleaned_text.clone(),
@@ -1826,7 +1929,7 @@ pub async fn stream_chat(
                 .await;
             for (tool_metadata, tool_message) in &persisted_native_tool_results {
                 let tool_content = extract_message_text(tool_message);
-                state
+                let _ = state
                     .add_message_with_metadata(
                         "tool".to_string(),
                         tool_content,
@@ -1912,6 +2015,8 @@ pub async fn stream_chat(
                 "turn_id": assistant_turn_id,
                 "status": "completed",
                 "client_request_id": request.client_request_id,
+                "conversation_id": conversation_id,
+                "assistant_message_id": draft_row_id,
             }),
         )
         .map_err(|e| KokoroError::Chat(e.to_string()))?;
@@ -1923,7 +2028,7 @@ pub async fn stream_chat(
             .emit_best_effort(
                 &HookEvent::AfterLlmResponse,
                 &build_chat_hook_payload(
-                    conversation_id.clone(),
+                    Some(conversation_id.clone()),
                     &char_id,
                     Some(assistant_turn_id.clone()),
                     Some(request.message.clone()),
@@ -2090,7 +2195,7 @@ pub async fn stream_chat(
                 )
                 .await;
             }
-            state
+            let _ = state
                 .add_message_with_metadata(
                     "assistant".to_string(),
                     full_response.clone(),
@@ -2140,10 +2245,7 @@ pub async fn stream_chat(
 
     if !request.hidden && state.is_memory_enabled() {
         if let Some(decision) = select_memory_ingress_decision(&request.message, &ingress_options) {
-            let conversation_key = conversation_id
-                .as_deref()
-                .unwrap_or("no-conversation")
-                .to_string();
+            let conversation_key = conversation_id.clone();
             let cooldown_key =
                 build_cooldown_key(&char_id, &conversation_key, decision.event.event_type);
             if state
@@ -2361,6 +2463,8 @@ pub async fn stream_chat(
             "turn_id": assistant_turn_id,
             "status": finish_status,
             "client_request_id": request.client_request_id,
+            "conversation_id": conversation_id,
+            "assistant_message_id": draft_row_id,
         }),
     )
     .map_err(|e| KokoroError::Chat(e.to_string()))?;
@@ -2370,7 +2474,10 @@ pub async fn stream_chat(
     .await;
 
     match stream_result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(StreamChatResponse {
+            conversation_id,
+            user_message_id,
+        }),
         Err(KokoroError::Chat(message)) if is_turn_cancelled_error_message(&message) => {
             tracing::info!(
                 target: "chat",
@@ -2383,10 +2490,15 @@ pub async fn stream_chat(
                     "turn_id": assistant_turn_id,
                     "status": "cancelled",
                     "client_request_id": request.client_request_id,
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": serde_json::Value::Null,
                 }),
             )
             .map_err(|e| KokoroError::Chat(e.to_string()))?;
-            Ok(())
+            Ok(StreamChatResponse {
+                conversation_id,
+                user_message_id,
+            })
         }
         Err(error) => Err(error),
     }
@@ -3492,5 +3604,176 @@ mod tests {
             cancel_chat_turn_inner("not-exists".to_string(), Some("user".into()), state).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("unknown turn_id"));
+    }
+
+    #[test]
+    fn chat_request_deserializes_regenerate_default_and_explicit() {
+        let default_req: ChatRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert!(!default_req.regenerate);
+
+        let regen_req: ChatRequest =
+            serde_json::from_str(r#"{"message":"hi","regenerate":true}"#).unwrap();
+        assert!(regen_req.regenerate);
+    }
+
+    #[test]
+    fn should_insert_user_message_skips_when_hidden() {
+        assert!(!should_insert_user_message_for_request(true, false, false));
+        assert!(!should_insert_user_message_for_request(true, true, false));
+        assert!(!should_insert_user_message_for_request(true, true, true));
+    }
+
+    #[test]
+    fn should_insert_user_message_always_inserts_for_normal_non_hidden_turn() {
+        assert!(should_insert_user_message_for_request(false, false, false));
+        assert!(should_insert_user_message_for_request(false, false, true));
+    }
+
+    #[test]
+    fn should_insert_user_message_skips_when_regenerating_and_history_has_trailing_user() {
+        // Normal regeneration: trailing user message already in history -> skip duplicate insertion
+        assert!(!should_insert_user_message_for_request(false, true, true));
+    }
+
+    #[test]
+    fn should_insert_user_message_heals_when_regenerating_but_history_lacks_trailing_user() {
+        // Defensive self-healing: if history was truncated/empty, fallback to inserting
+        assert!(should_insert_user_message_for_request(false, true, false));
+    }
+
+    async fn setup_test_chat_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                character_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                topic TEXT NOT NULL DEFAULT '',
+                pinned_state TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_resolve_trailing_visible_user_message_with_tools() {
+        let pool = setup_test_chat_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query("INSERT INTO conversations (id, character_id, title, created_at, updated_at) VALUES ('conv-tools', 'char-1', 'Test', ?, ?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 1. User message (id 1)
+        sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-tools', 'user', 'What is the weather?', NULL, ?)")
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 2. Technical tool call message (id 2)
+        sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-tools', 'assistant', 'call weather', '{\"type\":\"assistant_tool_calls\"}', ?)")
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 3. Technical tool result message (id 3)
+        sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-tools', 'tool', '{\"temperature\": 25}', '{\"type\":\"tool_result\"}', ?)")
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 4. Final assistant answer (id 4)
+        sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-tools', 'assistant', 'The weather is 25C sunny.', NULL, ?)")
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // When assistant answer is present, trailing visible message is assistant (NOT user)
+        let trailing_before = resolve_trailing_visible_user_message(&pool, "conv-tools").await.unwrap();
+        assert!(trailing_before.is_none(), "When assistant message is at the end, trailing visible user message must be None");
+
+        // Simulate deleting the visible assistant turn (which removes id 4, 3, 2)
+        sqlx::query("DELETE FROM conversation_messages WHERE id IN (2, 3, 4)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Now, the trailing visible message should be the user message (id 1)
+        let trailing_after = resolve_trailing_visible_user_message(&pool, "conv-tools").await.unwrap();
+        assert_eq!(trailing_after, Some((1, "What is the weather?".to_string())));
+
+        // Verify deduplication decision
+        assert!(!should_insert_user_message_for_request(false, true, trailing_after.is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_trailing_visible_user_message_in_long_conversation() {
+        let pool = setup_test_chat_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query("INSERT INTO conversations (id, character_id, title, created_at, updated_at) VALUES ('conv-long', 'char-1', 'Test', ?, ?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Populate 25 turns (50 messages: 25 users + 25 assistants)
+        for i in 1..=25 {
+            sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-long', 'user', ?, NULL, ?)")
+                .bind(format!("User question {}", i))
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            sqlx::query("INSERT INTO conversation_messages (conversation_id, role, content, metadata, created_at) VALUES ('conv-long', 'assistant', ?, NULL, ?)")
+                .bind(format!("Assistant reply {}", i))
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // Delete the last assistant reply (turn 25)
+        sqlx::query("DELETE FROM conversation_messages WHERE id = 50")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Check trailing visible user message
+        let trailing = resolve_trailing_visible_user_message(&pool, "conv-long").await.unwrap();
+        assert!(trailing.is_some());
+        let (id, content) = trailing.unwrap();
+        assert_eq!(id, 49);
+        assert_eq!(content, "User question 25");
+        assert!(!should_insert_user_message_for_request(false, true, true));
     }
 }
